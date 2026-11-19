@@ -1,0 +1,122 @@
+# ============================================
+# SupplyChainIQ — Docker Compose (Production)
+# ============================================
+version: "3.9"
+
+services:
+  # ---- PostgreSQL ----
+  postgres:
+    image: postgres:16-alpine
+    container_name: sciq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-supplychainiq}
+      POSTGRES_USER: ${POSTGRES_USER:-sciq_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sciq_dev_password_2024}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./warehouse/schema/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sciq_user} -d ${POSTGRES_DB:-supplychainiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---- Redis ----
+  redis:
+    image: redis:7-alpine
+    container_name: sciq-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---- FastAPI Backend ----
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sciq-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+      - REDIS_URL=redis://redis:6379/0
+      - APP_ENV=production
+      - MODEL_PATH=/app/ml_models
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ml/models:/app/ml_models:ro
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---- Next.js Frontend ----
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sciq-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  # ---- Streamlit Analytics ----
+  streamlit:
+    build:
+      context: .
+      dockerfile: streamlit/Dockerfile.prod
+    container_name: sciq-streamlit
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+      - API_URL=http://backend:8000/api
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./ml/models:/app/ml/models:ro
+    depends_on:
+      - backend
+      postgres:
+        condition: service_healthy
+
+  # ---- ETL Runner (one-shot) ----
+  etl:
+    build:
+      context: .
+      dockerfile: etl/Dockerfile
+    container_name: sciq-etl
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-sciq_user}:${POSTGRES_PASSWORD:-sciq_dev_password_2024}@postgres:5432/${POSTGRES_DB:-supplychainiq}
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - etl
+
+volumes:
+  pgdata:
+  redisdata:
